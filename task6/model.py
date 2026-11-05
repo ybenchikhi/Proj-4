@@ -11,6 +11,7 @@ import math
 
 from .rope import RoPE, apply_rotary_emb
 
+
 class customModel(torch.nn.Module):
     def __init__(self, hidden_dim, num_heads, num_layers, vocab_size, max_seq_len=4096):
         super().__init__()
@@ -121,7 +122,11 @@ class customAttention(torch.nn.Module):
             # TODO: Decode mode: update kv cache, then use cached KV for attention
             # Hint: Use custom_flash_attention_decode.update_kv_cache() and
             #       custom_flash_attention_decode.custom_flash_attention_decode()
-            raise NotImplementedError
+            k_cache, v_cache = kv_cache
+            custom_flash_attention_decode.update_kv_cache(k_cache, v_cache, k, v, current_pos)
+            k_full = k_cache[:, :current_pos + 1, :].contiguous()
+            v_full = v_cache[:, :current_pos + 1, :].contiguous()
+            o = custom_flash_attention_decode.custom_flash_attention_decode(q, k_full, v_full, self.num_heads, True)
 
             ##############################################################
         else:
@@ -130,7 +135,11 @@ class customAttention(torch.nn.Module):
             # TODO: Prefill mode: store kv cache and use regular flash attention
             # Hint: Store k, v into kv_cache, then call
             #       custom_flash_attention.custom_flash_attention()
-            raise NotImplementedError
+            if kv_cache is not None:
+                k_cache, v_cache = kv_cache
+                k_cache[:, current_pos:current_pos + seq_len, :] = k
+                v_cache[:, current_pos:current_pos + seq_len, :] = v
+            o = custom_flash_attention.custom_flash_attention(q, k, v, self.num_heads, True)
 
             ##############################################################
         

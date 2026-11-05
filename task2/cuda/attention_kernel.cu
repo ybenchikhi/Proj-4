@@ -11,13 +11,70 @@
 
 using namespace torch::indexing;
 
-__global__ void softmax_kernel_batched(float *inp, float *outp, int NUM_ROW, int NUM_COL)
-{
-    extern __shared__ float buffer[];
+__device__ __inline__ float warpReduceMax(float val){
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFFU, val, offset));
+    return val;
+}
 
+__device__ __inline__ float warpReduceSum(float val){
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xFFFFFFFFU, val, offset);
+    return val;
+}
+
+__global__ void softmax_kernel_batched(float *input, float *output, int NUM_ROW, int NUM_COL)
+{
     // ########################################################
 
-    // TODO: Implement the softmax operation 
+    extern __shared__ float buffer[];
+
+    int b = blockIdx.x;
+    int row = blockIdx.y;
+    int tx = threadIdx.x;
+    if (row >= NUM_ROW) return;
+
+    int lane = tx % warpSize;
+    int warpID = tx / warpSize;
+    int numWarps = (blockDim.x + warpSize - 1) / warpSize;
+
+    size_t offset = ((size_t)b * NUM_ROW + row) * NUM_COL;
+    float *in_row = input + offset;
+    float *out_row = output + offset;
+
+    float val = -FLT_MAX;
+    for (int j = tx; j < NUM_COL; j += blockDim.x)
+        val = fmaxf(val, in_row[j]);
+
+    val = warpReduceMax(val);
+    if (lane == 0) buffer[warpID] = val;
+    __syncthreads();
+    if (warpID == 0) {
+        val = (lane < numWarps) ? buffer[lane] : -FLT_MAX;
+        val = warpReduceMax(val);
+        if (lane == 0) buffer[0] = val;
+    }
+    __syncthreads();
+    float row_max = buffer[0];
+    __syncthreads();
+
+    val = 0.0f;
+    for (int j = tx; j < NUM_COL; j += blockDim.x)
+        val += expf(in_row[j] - row_max);
+
+    val = warpReduceSum(val);
+    if (lane == 0) buffer[warpID] = val;
+    __syncthreads();
+    if (warpID == 0) {
+        val = (lane < numWarps) ? buffer[lane] : 0.0f;
+        val = warpReduceSum(val);
+        if (lane == 0) buffer[0] = val;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / buffer[0];
+
+    for (int j = tx; j < NUM_COL; j += blockDim.x)
+        out_row[j] = expf(in_row[j] - row_max) * inv_sum;
 
     // ########################################################
 }
@@ -30,7 +87,34 @@ __global__ void GEMM_NT_kernel_batched(float *a_mat, float *b_mat, float *out_ma
 
     // ########################################################
 
-    // TODO: Implement the NT GEMM operation 
+    int batch = blockIdx.z;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * TILE_SIZE + ty;
+    int col = blockIdx.x * TILE_SIZE + tx;
+
+    float *A = a_mat + (size_t)batch * M * K;
+    float *B = b_mat + (size_t)batch * N * K;
+    float *C = out_mat + (size_t)batch * M * N;
+
+    float acc = 0.0f;
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t)
+    {
+        int a_k = t * TILE_SIZE + tx;
+        a_tile[ty][tx] = (row < M && a_k < K) ? A[(size_t)row * K + a_k] : 0.0f;
+
+        int b_n = blockIdx.x * TILE_SIZE + ty;
+        int b_k = t * TILE_SIZE + tx;
+        b_tile[tx][ty] = (b_n < N && b_k < K) ? B[(size_t)b_n * K + b_k] : 0.0f;
+
+        __syncthreads();
+        for (int k = 0; k < TILE_SIZE; ++k)
+            acc += a_tile[ty][k] * b_tile[k][tx];
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[(size_t)row * N + col] = acc;
 
     // ########################################################
 }
@@ -43,7 +127,33 @@ __global__ void GEMM_NN_kernel_batched(float *a_mat, float *b_mat, float *out_ma
 
     // ########################################################
 
-    // TODO: Implement the NN GEMM operation 
+    int batch = blockIdx.z;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * TILE_SIZE + ty;
+    int col = blockIdx.x * TILE_SIZE + tx;
+
+    float *A = a_mat + (size_t)batch * M * K;
+    float *B = b_mat + (size_t)batch * K * N;
+    float *C = out_mat + (size_t)batch * M * N;
+
+    float acc = 0.0f;
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t)
+    {
+        int a_k = t * TILE_SIZE + tx;
+        a_tile[ty][tx] = (row < M && a_k < K) ? A[(size_t)row * K + a_k] : 0.0f;
+
+        int b_k = t * TILE_SIZE + ty;
+        b_tile[ty][tx] = (b_k < K && col < N) ? B[(size_t)b_k * N + col] : 0.0f;
+
+        __syncthreads();
+        for (int k = 0; k < TILE_SIZE; ++k)
+            acc += a_tile[ty][k] * b_tile[k][tx];
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[(size_t)row * N + col] = acc;
 
     // ########################################################
 }
@@ -90,13 +200,27 @@ torch::Tensor custom_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v
 
     // ########################################################
 
+    int BH = batch_size * num_heads;
+    dim3 gemm_threads(TILE_SIZE, TILE_SIZE);
+
     // TODO: Run QK^T batched
+    dim3 qk_blocks((seq_len + TILE_SIZE - 1) / TILE_SIZE, (seq_len + TILE_SIZE - 1) / TILE_SIZE, BH);
+    GEMM_NT_kernel_batched<TILE_SIZE><<<qk_blocks, gemm_threads>>>(
+        q_bh.data_ptr<float>(), k_bh.data_ptr<float>(), qk.data_ptr<float>(), seq_len, seq_len, head_dim);
                 
     // TODO: Run Scale + causal mask batched (over BH, rows)
+    float scale = 1.0f / sqrtf((float)head_dim);
+    scale_and_causal_mask_batched<<<dim3(BH, seq_len), dim3(256)>>>(
+        qk.data_ptr<float>(), seq_len, seq_len, scale, causal);
     
     // TODO: Run Softmax batched along last dim
+    softmax_kernel_batched<<<dim3(BH, seq_len), dim3(256), 256 * sizeof(float)>>>(
+        qk.data_ptr<float>(), s.data_ptr<float>(), seq_len, seq_len);
     
     // TODO: Run (S @ V) batched
+    dim3 sv_blocks((head_dim + TILE_SIZE - 1) / TILE_SIZE, (seq_len + TILE_SIZE - 1) / TILE_SIZE, BH);
+    GEMM_NN_kernel_batched<TILE_SIZE><<<sv_blocks, gemm_threads>>>(
+        s.data_ptr<float>(), v_bh.data_ptr<float>(), o_bh.data_ptr<float>(), seq_len, head_dim, seq_len);
     
     // ########################################################
     
@@ -125,6 +249,8 @@ torch::Tensor test_batched_softmax(torch::Tensor inp, int dim) {
     auto outp = torch::empty(inp_sizes, inp.options());
     
     // Allocate shared memory for each thread in the block
+
+    //I want to do a cooperative groupm launch here
     softmax_kernel_batched<<<blocks_per_grid, threads_per_block, threads_per_block.x * sizeof(float)>>>(
         inp.data_ptr<float>(), outp.data_ptr<float>(), N_ROW, N_COL);
     
